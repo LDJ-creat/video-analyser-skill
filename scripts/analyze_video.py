@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 import time
+import shlex
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -55,10 +56,36 @@ def _is_localhost_8000(api_base: str) -> bool:
 
 
 def _find_backend_python(repo_root: Path) -> Path | None:
+    # Legacy lookup inside repo-relative services/core/.venv (Windows)
     venv_py = repo_root / "services" / "core" / ".venv" / "Scripts" / "python.exe"
     if venv_py.exists():
         return venv_py
+    # Try POSIX venv path
+    venv_py_posix = repo_root / "services" / "core" / ".venv" / "bin" / "python"
+    if venv_py_posix.exists():
+        return venv_py_posix
     return None
+
+
+def _load_env_file(path: Path) -> None:
+    """Load simple KEY=VALUE pairs from a .env file into os.environ if not set."""
+    try:
+        if not path.exists():
+            return
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                os.environ.setdefault(k, v)
+    except Exception:
+        # Ignore errors reading .env; environment variables may still be set externally
+        pass
 
 
 def ensure_backend_running(api_base: str, *, auto_start: bool, timeout_s: float = DEFAULT_AUTO_START_TIMEOUT_S) -> None:
@@ -79,18 +106,34 @@ def ensure_backend_running(api_base: str, *, auto_start: bool, timeout_s: float 
             "Start the backend manually or set VIDEO_HELPER_API_URL accordingly."
         )
 
+    # Require VIDEO_HELPER_BACKEND_DIR to be set in environment or .env for auto-start.
     repo_root = _repo_root_from_this_file()
-    backend_cwd = repo_root / "services" / "core"
+    _load_env_file(repo_root / ".env")
+
+    backend_root = os.environ.get("VIDEO_HELPER_BACKEND_DIR")
+    if not backend_root:
+        raise RuntimeError(
+            "Backend service unavailable and auto-start requires VIDEO_HELPER_BACKEND_DIR set in .env or environment. "
+            "Please set VIDEO_HELPER_BACKEND_DIR to the video-helper installation path (e.g. D:\\video-helper)."
+        )
+
+    backend_cwd = Path(backend_root) / "services" / "core"
     backend_main = backend_cwd / "main.py"
     if not backend_main.exists():
         raise RuntimeError(f"Cannot find backend entrypoint at {backend_main}")
 
-    py = _find_backend_python(repo_root)
-    if py is None:
+    # Find venv python inside the video-helper installation (.venv)
+    venv_win = backend_cwd / ".venv" / "Scripts" / "python.exe"
+    venv_posix = backend_cwd / ".venv" / "bin" / "python"
+    py = None
+    if venv_win.exists():
+        py = venv_win
+    elif venv_posix.exists():
+        py = venv_posix
+    else:
         raise RuntimeError(
-            "Backend service unavailable and auto-start could not find backend venv python. "
-            "Expected services/core/.venv/Scripts/python.exe. "
-            "Please create the backend venv or start the backend manually."
+            "Could not find Python executable in backend's .venv. "
+            f"Checked: {venv_win} and {venv_posix}. Ensure the backend venv exists."
         )
 
     log_dir = repo_root / "data" / "logs"

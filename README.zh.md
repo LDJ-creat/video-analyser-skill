@@ -8,8 +8,10 @@
 
 本 Skill 是 AI 编辑器与 **视频分析助手** 之间的桥梁。你 **必须** 先下载并配置完整项目：
 
-1.  **后端服务**: 下载并设置 [video-helper](https://github.com/LDJ-creat/video-helper)。
-2.  **配置**: 确保后端服务正常运行（默认地址通常为 `http://localhost:8000`）。
+1.  **后端服务**: 下载并设置 [video-helper](https://github.com/LDJ-creat/video-helper)（需要下载源码版本，该skill暂不支持仅下载video helper的桌面客户端使用）。
+2.  **配置**: 确保后端服务正常运行（默认地址为 `http://localhost:8000`）。在使用时该skill会自动启动后端服务，无需手动启动。
+
+3.  **设置安装路径**: 在该skill项目根目录下的.env文件中设置 video helper 的安装路径,从而确保该skill能找到该项目并自动启动后端服务。
 
 ## 📥 安装方式
 

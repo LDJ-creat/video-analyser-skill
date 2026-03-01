@@ -8,8 +8,10 @@ This skill enables AI editors (such as **Claude Code**, **GitHub Copilot**, **An
 
 This skill is a bridge between your AI editor and the **Video Analysis Assistant**. You **must** have the main project installed and configured:
 
-1.  **Backend Service**: Download and set up [video-helper](https://github.com/LDJ-creat/video-helper).
-2.  **Configuration**: Ensure the backend is running (typically at `http://localhost:8000`).
+1.  **Backend Service**: Download and set up [video-helper](https://github.com/LDJ-creat/video-helper). You must use the source-code version; this skill does not support using only the video-helper desktop client.
+2.  **Configuration**: Ensure the backend service is running (runs on `http://localhost:8000` by default). The skill can auto-start the backend when configured.
+
+3.  **Install path**: Open the `.env` file in the skill repository root and set the `VIDEO_HELPER_BACKEND_DIR` variable to the `video-helper` installation path so the skill can locate and auto-start the backend (for example: `D:\\video-helper`).
 
 ## 📥 Installation
 
