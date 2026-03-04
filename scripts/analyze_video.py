@@ -2,8 +2,9 @@
 """
 Video Analyzer - CLI tool to analyze videos via the video-helper backend API.
 
-This script creates a video analysis job, polls for completion, and returns
-the result links for viewing in the frontend.
+This script creates a video analysis job, then delegates all progress tracking
+to `poll_job.py` via subprocess (always stopping at the `blocked` state so the
+LLM can proceed with plan generation).
 
 Usage:
     python analyze_video.py <video_url_or_path> [--title "Video Title"] [--lang zh]
@@ -23,7 +24,6 @@ import os
 import subprocess
 import sys
 import time
-import shlex
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -34,15 +34,13 @@ from dataclasses import dataclass
 
 # Configuration
 DEFAULT_API_BASE = os.environ.get("VIDEO_HELPER_API_URL", "http://localhost:8000/api/v1")
-DEFAULT_POLL_INTERVAL_S = 2.0
-DEFAULT_TIMEOUT_S = 600.0  # 10 minutes max wait time
 
 DEFAULT_AUTO_START_TIMEOUT_S = 20.0
 
 
-def _repo_root_from_this_file() -> Path:
-    # scripts/ -> video-analyzer/ -> skill/ -> repo root
-    return Path(__file__).resolve().parents[3]
+def _skill_root_from_this_file() -> Path:
+    # scripts/ -> skill/ (the skill root)
+    return Path(__file__).resolve().parents[1]
 
 
 def _is_localhost_8000(api_base: str) -> bool:
@@ -55,15 +53,53 @@ def _is_localhost_8000(api_base: str) -> bool:
         return False
 
 
-def _find_backend_python(repo_root: Path) -> Path | None:
-    # Legacy lookup inside repo-relative services/core/.venv (Windows)
-    venv_py = repo_root / "services" / "core" / ".venv" / "Scripts" / "python.exe"
-    if venv_py.exists():
-        return venv_py
-    # Try POSIX venv path
-    venv_py_posix = repo_root / "services" / "core" / ".venv" / "bin" / "python"
-    if venv_py_posix.exists():
-        return venv_py_posix
+def _find_desktop_app_exe() -> Path | None:
+    """Locate the installed Video Helper desktop application executable.
+
+    Search order:
+    1. VIDEO_HELPER_DESKTOP_INSTALL_DIR env var (user-specified directory).
+    2. Default Windows install location: %LOCALAPPDATA%\\Programs\\Video Helper\\
+    3. Windows fallback: %ProgramFiles%\\Video Helper\\
+    4. macOS: ~/Applications/Video Helper.app/Contents/MacOS/Video Helper
+    """
+    # Determine the executable name for the current platform.
+    if os.name == "nt":  # Windows
+        exe_name = "Video Helper.exe"
+    else:  # macOS / Linux
+        exe_name = "Video Helper"
+
+    # 1. User-specified install directory via env var.
+    user_dir = os.environ.get("VIDEO_HELPER_DESKTOP_INSTALL_DIR", "").strip()
+    if user_dir:
+        candidate = Path(user_dir) / exe_name
+        if candidate.is_file():
+            return candidate
+        # Also check macOS .app bundle layout inside user_dir
+        mac_candidate = Path(user_dir) / "Video Helper.app" / "Contents" / "MacOS" / exe_name
+        if mac_candidate.is_file():
+            return mac_candidate
+
+    # 2. Default Windows paths.
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
+        candidates = [
+            Path(local_app_data) / "Programs" / "Video Helper" / exe_name,
+            Path(program_files) / "Video Helper" / exe_name,
+        ]
+        for c in candidates:
+            if c.is_file():
+                return c
+
+    # 3. macOS default path.
+    if sys.platform == "darwin":
+        mac_path = Path.home() / "Applications" / "Video Helper.app" / "Contents" / "MacOS" / exe_name
+        if mac_path.is_file():
+            return mac_path
+        system_mac_path = Path("/Applications") / "Video Helper.app" / "Contents" / "MacOS" / exe_name
+        if system_mac_path.is_file():
+            return system_mac_path
+
     return None
 
 
@@ -88,8 +124,39 @@ def _load_env_file(path: Path) -> None:
         pass
 
 
+def _check_health(api_base: str) -> bool:
+    """Check if the backend service is healthy (inline, no external dependencies)."""
+    try:
+        req = urllib.request.Request(
+            f"{api_base}/health",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode("utf-8"))
+                return data.get("ok", True) or data.get("status") == "ok"
+        return False
+    except Exception:
+        return False
+
+
+def _wait_for_backend(api_base: str, timeout_s: float, log_path: Path) -> None:
+    """Wait until the backend health check passes, or raise RuntimeError."""
+    deadline = time.time() + float(max(1.0, timeout_s))
+    while time.time() < deadline:
+        if _check_health(api_base):
+            return
+        time.sleep(0.5)
+
+    raise RuntimeError(
+        f"Backend auto-start attempted but health check still failing after {timeout_s}s. "
+        f"Check logs: {log_path}"
+    )
+
+
 def ensure_backend_running(api_base: str, *, auto_start: bool, timeout_s: float = DEFAULT_AUTO_START_TIMEOUT_S) -> None:
-    if check_health(api_base):
+    # ── Step 1: Already running? ───────────────────────────────────────────────
+    if _check_health(api_base):
         return
 
     if not auto_start:
@@ -106,21 +173,66 @@ def ensure_backend_running(api_base: str, *, auto_start: bool, timeout_s: float 
             "Start the backend manually or set VIDEO_HELPER_API_URL accordingly."
         )
 
-    # Require VIDEO_HELPER_BACKEND_DIR to be set in environment or .env for auto-start.
-    repo_root = _repo_root_from_this_file()
-    _load_env_file(repo_root / ".env")
+    # Load .env from the skill root only (the single source of truth for configuration).
+    skill_root = _skill_root_from_this_file()
+    _load_env_file(skill_root / ".env")
 
-    backend_root = os.environ.get("VIDEO_HELPER_BACKEND_DIR")
+    log_dir = skill_root / "data" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "skill-backend-autostart.log"
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+
+    # ── Step 2: Try desktop app first (Option B) ───────────────────────────────
+    desktop_exe = _find_desktop_app_exe()
+    if desktop_exe:
+        print(f"Auto-starting Video Helper desktop app: {desktop_exe}", file=sys.stderr)
+        with open(log_path, "ab", buffering=0) as log_fp:
+            try:
+                subprocess.Popen(
+                    [str(desktop_exe)],
+                    stdout=log_fp,
+                    stderr=log_fp,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                    close_fds=True,
+                )
+            except Exception as e:
+                print(f"Warning: Failed to auto-start desktop app: {e}", file=sys.stderr)
+                # Fall through to Option A
+            else:
+                try:
+                    _wait_for_backend(api_base, timeout_s, log_path)
+                    return  # Desktop app started successfully
+                except RuntimeError as e:
+                    print(f"Warning: Desktop app launched but backend did not become ready: {e}", file=sys.stderr)
+                    # Fall through to Option A
+
+    # ── Step 3: Fall back to source-code mode (Option A) ──────────────────────
+    backend_root = os.environ.get("VIDEO_HELPER_SOURCE_DIR", "").strip()
     if not backend_root:
-        raise RuntimeError(
-            "Backend service unavailable and auto-start requires VIDEO_HELPER_BACKEND_DIR set in .env or environment. "
-            "Please set VIDEO_HELPER_BACKEND_DIR to the video-helper installation path (e.g. D:\\video-helper)."
+        print(
+            "Error: Backend service is unavailable and no startup method succeeded.\n"
+            "\n"
+            "Please configure one of the following in the skill's .env file:\n"
+            "  Option A (source code): Set VIDEO_HELPER_SOURCE_DIR to the root of your video-helper project\n"
+            "                          e.g. VIDEO_HELPER_SOURCE_DIR=D:\\video-helper\n"
+            "  Option B (desktop app): Install the Video Helper desktop app,\n"
+            "                          or set VIDEO_HELPER_DESKTOP_INSTALL_DIR if installed to a\n"
+            "                          non-default location.",
+            file=sys.stderr,
         )
+        sys.exit(1)
 
     backend_cwd = Path(backend_root) / "services" / "core"
     backend_main = backend_cwd / "main.py"
     if not backend_main.exists():
-        raise RuntimeError(f"Cannot find backend entrypoint at {backend_main}")
+        raise RuntimeError(
+            f"Cannot find backend entrypoint at {backend_main}. "
+            f"Please verify VIDEO_HELPER_SOURCE_DIR points to the video-helper project root."
+        )
 
     # Find venv python inside the video-helper installation (.venv)
     venv_win = backend_cwd / ".venv" / "Scripts" / "python.exe"
@@ -136,17 +248,11 @@ def ensure_backend_running(api_base: str, *, auto_start: bool, timeout_s: float 
             f"Checked: {venv_win} and {venv_posix}. Ensure the backend venv exists."
         )
 
-    log_dir = repo_root / "data" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "skill-backend-autostart.log"
+    print(f"Auto-starting backend via source code: {backend_main}", file=sys.stderr)
 
     env = os.environ.copy()
     env.setdefault("WORKER_ENABLE", "1")
     env.setdefault("PYTHONUNBUFFERED", "1")
-
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
 
     with open(log_path, "ab", buffering=0) as log_fp:
         try:
@@ -161,19 +267,9 @@ def ensure_backend_running(api_base: str, *, auto_start: bool, timeout_s: float 
                 close_fds=True,
             )
         except Exception as e:
-            raise RuntimeError(f"Failed to auto-start backend: {e}") from e
+            raise RuntimeError(f"Failed to auto-start backend (source-code): {e}") from e
 
-    # Wait until health endpoint becomes ready.
-    deadline = time.time() + float(max(1.0, timeout_s))
-    while time.time() < deadline:
-        if check_health(api_base):
-            return
-        time.sleep(0.5)
-
-    raise RuntimeError(
-        f"Backend auto-start attempted but health check still failing after {timeout_s}s. "
-        f"Check logs: {log_path}"
-    )
+    _wait_for_backend(api_base, timeout_s, log_path)
 
 
 @dataclass
@@ -183,66 +279,11 @@ class JobResult:
     project_id: str
     status: str
     error: Optional[str] = None
-    result_url: Optional[str] = None
-    frontend_url: Optional[str] = None
-    plan_request_url: Optional[str] = None
 
 
 def get_api_base() -> str:
     """Get the API base URL from environment or default."""
     return os.environ.get("VIDEO_HELPER_API_URL", DEFAULT_API_BASE)
-
-
-def get_frontend_base() -> str:
-    """Get the frontend base URL for result links."""
-    # Frontend typically runs on port 3000
-    return os.environ.get("VIDEO_HELPER_FRONTEND_URL", "http://localhost:3000")
-
-
-def http_request(
-    url: str,
-    method: str = "GET",
-    data: Optional[bytes] = None,
-    headers: Optional[dict] = None,
-    timeout: float = 30.0,
-) -> tuple[int, dict | bytes]:
-    """Make an HTTP request and return (status_code, response_body)."""
-    if headers is None:
-        headers = {}
-    
-    headers.setdefault("Accept", "application/json")
-    
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            status = response.status
-            content_type = response.headers.get("Content-Type", "")
-            body = response.read()
-            
-            if "application/json" in content_type:
-                return status, json.loads(body.decode("utf-8"))
-            return status, body
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8")
-        try:
-            return e.code, json.loads(body)
-        except json.JSONDecodeError:
-            return e.code, {"error": body}
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Connection failed: {e.reason}") from e
-
-
-def check_health(api_base: str) -> bool:
-    """Check if the backend service is healthy."""
-    try:
-        status, response = http_request(f"{api_base}/health", timeout=5.0)
-        if status == 200:
-            data = response if isinstance(response, dict) else {}
-            return data.get("ok", True) or data.get("status") == "ok"
-        return False
-    except Exception:
-        return False
 
 
 def is_url(source: str) -> bool:
@@ -260,6 +301,28 @@ def infer_source_type(url: str) -> str:
     return "url"
 
 
+def _http_post_json(url: str, payload: dict, timeout: float = 30.0) -> tuple[int, dict]:
+    """Minimal POST helper for job creation only."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        try:
+            return e.code, json.loads(body)
+        except json.JSONDecodeError:
+            return e.code, {"error": body}
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Connection failed: {e.reason}") from e
+
+
 def create_job_from_url(
     api_base: str,
     source_url: str,
@@ -269,8 +332,8 @@ def create_job_from_url(
 ) -> JobResult:
     """Create an analysis job from a video URL."""
     source_type = infer_source_type(source_url)
-    
-    payload = {
+
+    payload: dict[str, Any] = {
         "sourceUrl": source_url,
         "sourceType": source_type,
     }
@@ -280,25 +343,16 @@ def create_job_from_url(
         payload["outputLanguage"] = output_language
     if llm_mode:
         payload["llmMode"] = llm_mode
-    
-    data = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    
-    status, response = http_request(
-        f"{api_base}/jobs",
-        method="POST",
-        data=data,
-        headers=headers,
-        timeout=30.0,
-    )
-    
+
+    status, response = _http_post_json(f"{api_base}/jobs", payload, timeout=30.0)
+
     if status != 200:
         error_msg = "Unknown error"
         if isinstance(response, dict):
             error_data = response.get("error", {})
             error_msg = error_data.get("message", str(response))
         raise RuntimeError(f"Failed to create job: {error_msg}")
-    
+
     return JobResult(
         job_id=response["jobId"],
         project_id=response["projectId"],
@@ -317,33 +371,33 @@ def create_job_from_file(
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"Video file not found: {file_path}")
-    
+
     # Check file extension
     valid_extensions = {".mp4", ".mkv", ".webm", ".mov"}
     if path.suffix.lower() not in valid_extensions:
         raise ValueError(f"Unsupported file type: {path.suffix}. Supported: {valid_extensions}")
-    
+
     # Read file content
     with path.open("rb") as f:
         file_content = f.read()
-    
+
     # Build multipart form data
     boundary = f"----WebKitFormBoundary{int(time.time() * 1000)}"
-    
+
     def encode_field(name: str, value: str) -> bytes:
         return (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
             f"{value}\r\n"
         ).encode("utf-8")
-    
+
     def encode_file(name: str, filename: str, content: bytes, content_type: str) -> bytes:
         return (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
             f"Content-Type: {content_type}\r\n\r\n"
         ).encode("utf-8") + content + b"\r\n"
-    
+
     # Build body
     body_parts = []
     body_parts.append(encode_field("sourceType", "upload"))
@@ -353,7 +407,7 @@ def create_job_from_file(
         body_parts.append(encode_field("outputLanguage", output_language))
     if llm_mode:
         body_parts.append(encode_field("llmMode", llm_mode))
-    
+
     # Guess content type
     content_type = "video/mp4"
     if path.suffix.lower() == ".mkv":
@@ -362,101 +416,55 @@ def create_job_from_file(
         content_type = "video/webm"
     elif path.suffix.lower() == ".mov":
         content_type = "video/quicktime"
-    
+
     body_parts.append(encode_file("file", path.name, file_content, content_type))
     body_parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-    
+
     body = b"".join(body_parts)
     headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
-    
-    status, response = http_request(
+
+    data = body
+    req = urllib.request.Request(
         f"{api_base}/jobs",
-        method="POST",
-        data=body,
+        data=data,
         headers=headers,
-        timeout=60.0,  # Longer timeout for file upload
+        method="POST",
     )
-    
+    try:
+        with urllib.request.urlopen(req, timeout=60.0) as response:
+            status = response.status
+            resp_body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body_str = e.read().decode("utf-8")
+        try:
+            status, resp_body = e.code, json.loads(body_str)
+        except json.JSONDecodeError:
+            status, resp_body = e.code, {"error": body_str}
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Connection failed: {e.reason}") from e
+
     if status != 200:
         error_msg = "Unknown error"
-        if isinstance(response, dict):
-            error_data = response.get("error", {})
-            error_msg = error_data.get("message", str(response))
+        if isinstance(resp_body, dict):
+            error_data = resp_body.get("error", {})
+            error_msg = error_data.get("message", str(resp_body))
         raise RuntimeError(f"Failed to create job: {error_msg}")
-    
+
     return JobResult(
-        job_id=response["jobId"],
-        project_id=response["projectId"],
-        status=response["status"],
+        job_id=resp_body["jobId"],
+        project_id=resp_body["projectId"],
+        status=resp_body["status"],
     )
 
 
-def get_job_status(api_base: str, job_id: str) -> dict:
-    """Get the current status of a job."""
-    status, response = http_request(f"{api_base}/jobs/{job_id}", timeout=10.0)
-    
-    if status != 200:
-        error_msg = "Unknown error"
-        if isinstance(response, dict):
-            error_data = response.get("error", {})
-            error_msg = error_data.get("message", str(response))
-        raise RuntimeError(f"Failed to get job status: {error_msg}")
-    
-    return response
-
-
-def poll_job_until_complete(
-    api_base: str,
-    job_id: str,
-    poll_interval: float = DEFAULT_POLL_INTERVAL_S,
-    timeout: float = DEFAULT_TIMEOUT_S,
-) -> JobResult:
-    """Poll job status until it completes (succeeded, failed, or canceled)."""
-    start_time = time.time()
-    terminal_statuses = {"succeeded", "failed", "canceled", "blocked"}
-    
-    last_stage = None
-    last_progress = None
-    
-    while True:
-        elapsed = time.time() - start_time
-        if elapsed > timeout:
-            raise TimeoutError(f"Job polling timed out after {timeout}s")
-        
-        job = get_job_status(api_base, job_id)
-        status = job.get("status", "unknown")
-        stage = job.get("stage", "unknown")
-        progress = job.get("progress")
-        error = job.get("error")
-        
-        # Print progress updates
-        if stage != last_stage or progress != last_progress:
-            progress_str = f" ({progress * 100:.0f}%)" if progress is not None else ""
-            print(f"[{stage}]{progress_str} - status: {status}", file=sys.stderr)
-            last_stage = stage
-            last_progress = progress
-        
-        if status in terminal_statuses:
-            result = JobResult(
-                job_id=job_id,
-                project_id=job.get("projectId", ""),
-                status=status,
-                error=error.get("message") if error else None,
-            )
-            
-            if status == "succeeded":
-                frontend_base = get_frontend_base()
-                api_base_url = get_api_base()
-                result.result_url = f"{api_base_url}/projects/{result.project_id}/results/latest"
-                result.frontend_url = f"{frontend_base}/project/{result.project_id}"
-
-            if status == "blocked":
-                # External LLM flow: the backend is waiting for a plan to be submitted.
-                result.plan_request_url = f"{api_base}/jobs/{job_id}/plan-request"
-            
-            return result
-        
-        time.sleep(poll_interval)
+def _run_poll_job(job_id: str, *, stop_on_blocked: bool) -> int:
+    """Invoke poll_job.py as a subprocess and stream its output. Returns exit code."""
+    poll_script = Path(__file__).resolve().parent / "poll_job.py"
+    cmd = [sys.executable, str(poll_script), job_id]
+    if stop_on_blocked:
+        cmd.append("--stop-on-blocked")
+    proc = subprocess.run(cmd)
+    return proc.returncode
 
 
 def analyze_video(
@@ -465,28 +473,29 @@ def analyze_video(
     output_language: Optional[str] = None,
     llm_mode: Optional[str] = "external",
     auto_start_backend: bool = True,
-    poll_interval: float = DEFAULT_POLL_INTERVAL_S,
-    timeout: float = DEFAULT_TIMEOUT_S,
 ) -> JobResult:
     """
-    Analyze a video by creating a job and waiting for completion.
-    
+    Analyze a video by creating a job and delegating polling to poll_job.py.
+
+    Always stops at the `blocked` state (transcription complete) and prints
+    next-step instructions for the LLM to continue the pipeline.
+
     Args:
         source: Video URL or local file path
         title: Optional video title
         output_language: Optional output language for analysis (e.g., "zh", "en")
-        poll_interval: Seconds between status polls
-        timeout: Maximum seconds to wait for completion
-    
+        llm_mode: "external" (default) or "backend"
+        auto_start_backend: Whether to auto-start the backend if not running
+
     Returns:
-        JobResult with job status and result URLs
+        JobResult with job_id, project_id, and terminal status
     """
     api_base = get_api_base()
 
     ensure_backend_running(api_base, auto_start=auto_start_backend)
-    
+
     print(f"API Base: {api_base}", file=sys.stderr)
-    
+
     # Create job
     if is_url(source):
         print(f"Creating analysis job for URL: {source}", file=sys.stderr)
@@ -494,18 +503,15 @@ def analyze_video(
     else:
         print(f"Creating analysis job for file: {source}", file=sys.stderr)
         result = create_job_from_file(api_base, source, title, output_language, llm_mode=llm_mode)
-    
+
     print(f"Job created: job_id={result.job_id}, project_id={result.project_id}", file=sys.stderr)
-    
-    # Poll until complete
-    print("Waiting for analysis to complete...", file=sys.stderr)
-    result = poll_job_until_complete(
-        api_base,
-        result.job_id,
-        poll_interval=poll_interval,
-        timeout=timeout,
-    )
-    
+
+    # Delegate all polling to poll_job.py, always stopping at `blocked`
+    # so the LLM receives the next-step instructions.
+    exit_code = _run_poll_job(result.job_id, stop_on_blocked=True)
+    if exit_code != 0:
+        sys.exit(exit_code)
+
     return result
 
 
@@ -519,13 +525,14 @@ Examples:
   %(prog)s "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
   %(prog)s "https://www.bilibili.com/video/BV1xx411c7mD" --lang zh
   %(prog)s "/path/to/video.mp4" --title "My Video"
+  %(prog)s "https://youtu.be/xyz" --wait   # poll all the way to succeeded
 
 Environment Variables:
   VIDEO_HELPER_API_URL      Backend API URL (default: http://localhost:8000/api/v1)
   VIDEO_HELPER_FRONTEND_URL Frontend URL for result links (default: http://localhost:3000)
 """,
     )
-    
+
     parser.add_argument(
         "source",
         help="Video URL (YouTube, Bilibili, etc.) or local file path",
@@ -540,18 +547,6 @@ Environment Variables:
         help="Output language for analysis (e.g., 'zh' for Chinese)",
     )
     parser.add_argument(
-        "--poll-interval",
-        type=float,
-        default=DEFAULT_POLL_INTERVAL_S,
-        help=f"Seconds between status polls (default: {DEFAULT_POLL_INTERVAL_S})",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=DEFAULT_TIMEOUT_S,
-        help=f"Maximum seconds to wait for completion (default: {DEFAULT_TIMEOUT_S})",
-    )
-    parser.add_argument(
         "--llm-mode",
         choices=["external", "backend"],
         default="external",
@@ -562,53 +557,18 @@ Environment Variables:
         action="store_true",
         help="Do not auto-start backend when it is not running",
     )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output result as JSON",
-    )
-    
+
     args = parser.parse_args()
-    
+
     try:
-        result = analyze_video(
+        analyze_video(
             source=args.source,
             title=args.title,
             output_language=args.language,
             llm_mode=args.llm_mode,
             auto_start_backend=not args.no_auto_start_backend,
-            poll_interval=args.poll_interval,
-            timeout=args.timeout,
         )
-        
-        if args.json:
-            output = {
-                "jobId": result.job_id,
-                "projectId": result.project_id,
-                "status": result.status,
-                "error": result.error,
-                "resultUrl": result.result_url,
-                "frontendUrl": result.frontend_url,
-                "planRequestUrl": result.plan_request_url,
-            }
-            print(json.dumps(output, indent=2))
-        else:
-            if result.status == "succeeded":
-                print(f"\nAnalysis completed successfully!")
-                print(f"Project ID: {result.project_id}")
-                print(f"Result API: {result.result_url}")
-                print(f"View in browser: {result.frontend_url}")
-            elif result.status == "blocked":
-                print("\nAnalysis is waiting for external AI plan (blocked).")
-                if result.plan_request_url:
-                    print(f"Plan request: {result.plan_request_url}")
-                print("Next: use your AI editor to generate plan JSON and POST it to /api/v1/jobs/{jobId}/plan, then rerun polling.")
-            else:
-                print(f"\nAnalysis {result.status}.")
-                if result.error:
-                    print(f"Error: {result.error}")
-                sys.exit(1)
-    
+
     except KeyboardInterrupt:
         print("\nCancelled by user.", file=sys.stderr)
         sys.exit(130)

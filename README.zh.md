@@ -6,12 +6,34 @@
 
 ## 🚀 前置要求
 
-本 Skill 是 AI 编辑器与 **视频分析助手** 之间的桥梁。你 **必须** 先下载并配置完整项目：
+本 Skill 是 AI 编辑器与 **视频分析助手** 之间的桥梁。你需要让 Video Helper 服务处于可用状态——选择以下任意一种方式即可：
 
-1.  **后端服务**: 下载并设置 [video-helper](https://github.com/LDJ-creat/video-helper)（需要下载源码版本，该skill暂不支持仅下载video helper的桌面客户端使用）。
-2.  **配置**: 确保后端服务正常运行（默认地址为 `http://localhost:8000`）。在使用时该skill会自动启动后端服务，无需手动启动。
+### 方式 A：安装桌面客户端（推荐普通用户）
 
-3.  **设置安装路径**: 在该skill项目根目录下的.env文件中设置 video helper 的安装路径,从而确保该skill能找到该项目并自动启动后端服务。
+1. 从 [releases 页面](https://github.com/LDJ-creat/video-helper/releases) 下载并安装 **Video Helper 桌面应用**。
+2. 该应用已内置后端服务，Skill 会在需要时自动启动它。
+3. **（可选）** 如果你将应用安装在了非默认路径，请在该 Skill 根目录下的 `.env` 文件中设置：
+   ```
+   VIDEO_HELPER_DESKTOP_INSTALL_DIR=C:\你的自定义安装路径
+   ```
+   留空则由 Skill 自动探测默认安装位置（无需手动配置）。
+
+### 方式 B：克隆源码（适合开发者）
+
+1. 从 GitHub 克隆并配置 [video-helper](https://github.com/LDJ-creat/video-helper) 源码。
+2. 在该 Skill 根目录下的 `.env` 文件中设置 `VIDEO_HELPER_SOURCE_DIR` 为克隆的项目根目录路径，例如：
+   ```
+   VIDEO_HELPER_SOURCE_DIR=D:\video-helper
+   ```
+   Skill 会在需要时自动启动后端服务（含任务 Worker），无需手动启动。
+3. **（可选）自定义服务 URL**：
+   如果你在非默认端口（8000/3000）或远程服务器上运行服务，请同步更新 `.env` 中的相关设置：
+   ```
+   VIDEO_HELPER_API_URL=http://localhost:8000/api/v1
+   VIDEO_HELPER_FRONTEND_URL=http://localhost:3000
+   ```
+
+> **注意：** 若桌面端未安装或启动失败，脚本会自动降级到 `VIDEO_HELPER_SOURCE_DIR` 源码启动方式。
 
 ## 📥 安装方式
 
@@ -44,9 +66,9 @@ chmod +x install.sh
 
 安装完成后，你只需直接向 AI 编辑器发送视频分析指令即可：
 
-> “帮我分析一下这个视频：https://www.youtube.com/watch?v=VIDEO_ID”
+> "帮我分析一下这个视频：https://www.youtube.com/watch?v=VIDEO_ID"
 
-AI 将调用本 Skill 触发分析流水线。你可以在 **视频分析助手** 的 Web 端或桌面端查看生成的结构化结果（思维导图、重点摘要、时间戳等）：
+AI 将调用本 Skill 触发分析流水线。若 Video Helper 应用尚未运行，Skill 会自动将其启动。你可以在 **视频分析助手** 的桌面端或 Web 端查看生成的结构化结果（思维导图、重点摘要、时间戳等）：
 
 🔗 **查看结果**: [https://github.com/LDJ-creat/video-helper](https://github.com/LDJ-creat/video-helper)
 

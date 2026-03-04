@@ -6,12 +6,34 @@ This skill enables AI editors (such as **Claude Code**, **GitHub Copilot**, **An
 
 ## 🚀 Prerequisites
 
-This skill is a bridge between your AI editor and the **Video Analysis Assistant**. You **must** have the main project installed and configured:
+This skill is a bridge between your AI editor and the **Video Analysis Assistant**. You need the Video Helper service running — choose either option below:
 
-1.  **Backend Service**: Download and set up [video-helper](https://github.com/LDJ-creat/video-helper). You must use the source-code version; this skill does not support using only the video-helper desktop client.
-2.  **Configuration**: Ensure the backend service is running (runs on `http://localhost:8000` by default). The skill can auto-start the backend when configured.
+### Option A: Desktop Client (Recommended for most users)
 
-3.  **Install path**: Open the `.env` file in the skill repository root and set the `VIDEO_HELPER_BACKEND_DIR` variable to the `video-helper` installation path so the skill can locate and auto-start the backend (for example: `D:\\video-helper`).
+1. Download and install the **Video Helper desktop app** from the [releases page](https://github.com/LDJ-creat/video-helper/releases).
+2. The app includes the backend service. The skill will automatically launch it when needed.
+3. **(Optional)** If you installed the app to a non-default location, open the `.env` file in the skill root and set:
+   ```
+   VIDEO_HELPER_DESKTOP_INSTALL_DIR=C:\your\custom\install\path
+   ```
+   If left blank, the skill will auto-detect the default install location.
+
+### Option B: Source Code (For developers)
+
+1. Clone and set up [video-helper](https://github.com/LDJ-creat/video-helper) from source.
+2. Open the `.env` file in the skill root and set `VIDEO_HELPER_SOURCE_DIR` to the cloned project root, for example:
+   ```
+   VIDEO_HELPER_SOURCE_DIR=D:\video-helper
+   ```
+   The skill will automatically start the backend (including its worker) when needed.
+3. **(Optional) Custom Service URLs**:
+   If you are running the service on non-default ports (8000/3000) or a remote server, update `.env`:
+   ```
+   VIDEO_HELPER_API_URL=http://localhost:8000/api/v1
+   VIDEO_HELPER_FRONTEND_URL=http://localhost:3000
+   ```
+
+> **Note:** If the desktop app is not installed or fails to start, the skill automatically falls back to source-code mode using `VIDEO_HELPER_SOURCE_DIR`.
 
 ## 📥 Installation
 
@@ -46,7 +68,7 @@ Once installed, you can simply ask your AI editor to analyze a video:
 
 > "Help me analyze this video: https://www.youtube.com/watch?v=VIDEO_ID"
 
-The AI will use the skill to trigger the analysis pipeline. You can view the structured results (mind maps, highlights, timestamps) in the **Video Analysis Assistant** web or desktop interface:
+The AI will use the skill to trigger the analysis pipeline. If the Video Helper app is not already running, it will be started automatically. You can view the structured results (mind maps, highlights, timestamps) in the **Video Analysis Assistant** interface:
 
 🔗 **View Results**: [https://github.com/LDJ-creat/video-helper](https://github.com/LDJ-creat/video-helper)
 
