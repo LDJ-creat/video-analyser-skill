@@ -131,6 +131,21 @@ def http_request(url: str, timeout: float = 10.0) -> tuple[int, dict]:
         raise RuntimeError(f"Connection failed: {e}")
 
 
+def _probe_long_video_chunks(job_id: str, api_base: str) -> tuple[bool, dict | None]:
+    """Return (ok, payload) for GET /jobs/{jobId}/chunks.
+
+    ok=False means the probe failed and caller should fall back to generic next steps.
+    """
+    url = f"{api_base}/jobs/{job_id}/chunks"
+    try:
+        status, payload = http_request(url, timeout=20.0)
+    except Exception:
+        return False, None
+    if status != 200 or not isinstance(payload, dict):
+        return False, None
+    return True, payload
+
+
 # ---------------------------------------------------------------------------
 # Core poll loop
 # ---------------------------------------------------------------------------
@@ -186,10 +201,27 @@ def poll_job(
                     print(f"\nJob ID:     {job_id}")
                     print(f"Project ID: {project_id}")
                     print("\nNext steps:")
-                    print(f"  1. Run: python scripts/fetch_plan.py {job_id}")
-                    print(f"  2. Review the plan and generate a revised plan JSON.")
-                    print(f"  3. Run: python scripts/submit_plan.py {job_id} <plan.json>")
-                    print(f"  4. Run: python scripts/poll_job.py {job_id}")
+                    ok, chunk_payload = _probe_long_video_chunks(job_id, api_base)
+                    is_long_video = bool(chunk_payload and chunk_payload.get("isLongVideo"))
+                    if ok and is_long_video:
+                        chunk_count = int(chunk_payload.get("chunkCount") or 0)
+                        total_batches = int(chunk_payload.get("totalBatches") or ((chunk_count + 2) // 3))
+                        print(
+                            f"  Detected long-video mode: {chunk_count} chunks, "
+                            f"batch size=3, total rounds={total_batches}."
+                        )
+                        print(f"  1. Run: python scripts/fetch_chunks.py {job_id}")
+                        print("  2. Generate chunk summaries in batches of 3 (write summaries.json).")
+                        print(f"  3. Run: python scripts/submit_chunk_summaries.py {job_id} summaries.json")
+                        print(f"  4. Run: python scripts/fetch_plan.py {job_id}")
+                        print("  5. Review the plan request and generate a revised plan JSON.")
+                        print(f"  6. Run: python scripts/submit_plan.py {job_id} <plan.json>")
+                        print(f"  7. Run: python scripts/poll_job.py {job_id}")
+                    else:
+                        print(f"  1. Run: python scripts/fetch_plan.py {job_id}")
+                        print("  2. Review the plan and generate a revised plan JSON.")
+                        print(f"  3. Run: python scripts/submit_plan.py {job_id} <plan.json>")
+                        print(f"  4. Run: python scripts/poll_job.py {job_id}")
                 else:
                     print("Action Required: Fetch plan request and submit your generated plan.")
 
